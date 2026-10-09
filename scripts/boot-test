@@ -4,12 +4,12 @@
 # seed shaped like Proxmox's user data. Its overlay disk is discarded
 # afterwards, so the qcow2 is never modified.
 #
-# Usage: scripts/smoke-boot <qcow2>
+# Usage: scripts/boot-test <qcow2>
 # Needs qemu, KVM, xorriso, ssh and jq on the host.
 set -euo pipefail
 
-qcow2=$(realpath "${1:?usage: smoke-boot <qcow2>}")
-port=${SMOKE_SSH_PORT:-2222}
+qcow2=$(realpath "${1:?usage: boot-test <qcow2>}")
+port=${BOOT_TEST_SSH_PORT:-2222}
 disk_size=20G
 stable=ghcr.io/jeremytondo/atelieros:stable
 
@@ -20,17 +20,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
-ssh-keygen -q -t ed25519 -N "" -C smoke -f "$work/key"
+ssh-keygen -q -t ed25519 -N "" -C boot-test -f "$work/key"
 qemu-img create -q -f qcow2 -b "$qcow2" -F qcow2 "$work/disk.qcow2" "$disk_size"
 
 # Proxmox sends `user:` as a string, which cloud-init reports as DEPRECATED.
 mkdir "$work/seed"
 cat >"$work/seed/user-data" <<EOF
 #cloud-config
-hostname: smoke
+hostname: boot-test
 manage_etc_hosts: true
-fqdn: smoke.local
-user: smoke
+fqdn: boot-test.local
+user: tester
 ssh_authorized_keys:
   - $(cat "$work/key.pub")
 chpasswd:
@@ -38,7 +38,7 @@ chpasswd:
 users:
   - default
 EOF
-printf 'instance-id: smoke-%s\nlocal-hostname: smoke\n' "$(date +%s)" >"$work/seed/meta-data"
+printf 'instance-id: boot-test-%s\nlocal-hostname: boot-test\n' "$(date +%s)" >"$work/seed/meta-data"
 xorriso -as mkisofs -quiet -o "$work/seed.iso" -V cidata -J -r "$work/seed"
 
 qemu-system-x86_64 \
@@ -53,7 +53,7 @@ qemu-system-x86_64 \
 vm() {
     ssh -i "$work/key" -p "$port" -o BatchMode=yes -o ConnectTimeout=5 \
         -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
-        smoke@127.0.0.1 "$@"
+        tester@127.0.0.1 "$@"
 }
 
 echo "Waiting for SSH on port $port"
@@ -112,7 +112,7 @@ check "update timer is download-only" \
     "$(vm systemctl show -P ExecStart bootc-fetch-apply-updates.service | grep -o -- '--download-only')" --download-only
 
 if [ "$failed" -ne 0 ]; then
-    echo "Smoke boot failed"
+    echo "Boot test failed"
     exit 1
 fi
-echo "Smoke boot passed"
+echo "Boot test passed"
