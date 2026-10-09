@@ -1,0 +1,3 @@
+# Root filesystem for disk images and `bootc install`.
+[install.filesystem.root]
+type = "xfs"

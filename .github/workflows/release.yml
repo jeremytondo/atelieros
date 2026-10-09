@@ -1,0 +1,203 @@
+name: Release
+
+# One workflow, one input, following ATC. patch/minor/major cut a production
+# release: the next version is computed from the remote's tags, the commit is
+# tagged, and the image is built from it and pushed as :vX.Y.Z and :stable,
+# with a GitHub Release carrying the qcow2. dev rebuilds the dispatched ref
+# and pushes the moving :dev tag only. The weekly schedule cuts a patch
+# release from main so Fedora's updates reach :stable.
+#
+# Production tags, images and releases are never moved, edited or deleted.
+# A failed production run never advances the version chain: re-running it
+# resumes the newest tag until its release is complete.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "patch/minor/major cut a production release from this ref; dev refreshes :dev"
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+          - dev
+  schedule:
+    - cron: "23 4 * * 1"
+
+concurrency: release
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  IMAGE: ghcr.io/jeremytondo/atelieros
+  # Scheduled runs have no inputs.
+  BUMP: ${{ inputs.bump || 'patch' }}
+  # image-builder writes a zlib-compressed qcow2, which Proxmox imports like
+  # Fedora's cloud images. GitHub caps release assets at 2 GiB.
+  IMAGE_BUILDER: ghcr.io/osbuild/image-builder-cli:v86.0.0
+  MAX_ASSET_BYTES: "2147483648"
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # Rootful podman throughout: image-builder reads the image from root's
+      # container storage.
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: sudo podman login ghcr.io --username "${{ github.actor }}" --password-stdin <<<"$GH_TOKEN"
+
+      - name: Refresh dev image
+        if: env.BUMP == 'dev'
+        run: |
+          sudo podman build \
+            --build-arg VERSION="dev-${GITHUB_SHA:0:12}" \
+            --build-arg REVISION="$GITHUB_SHA" \
+            --tag "$IMAGE:dev" .
+          sudo podman push "$IMAGE:dev"
+
+      - name: Free disk space for the qcow2 build
+        if: env.BUMP != 'dev'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Choose version
+        if: env.BUMP != 'dev'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch --tags --force origin
+          tags=$(git tag --list 'v*' | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sort -V)
+          latest=$(tail -n1 <<<"$tags")
+
+          # A complete release has the qcow2 and its checksum. Resume a newest
+          # tag without one rather than bumping past it.
+          next=""
+          if [ -n "$latest" ]; then
+            assets=$(gh release view "$latest" --json assets --jq '.assets | length' 2>/dev/null || echo 0)
+            if [ "$assets" -lt 2 ]; then
+              tagged=$(git rev-parse "${latest}^{commit}")
+              if [ "$tagged" != "$GITHUB_SHA" ]; then
+                echo "::error::$latest has no complete release and points at $tagged, not this ref's head $GITHUB_SHA; re-dispatch from that commit, or delete the tag to abandon that version"
+                exit 1
+              fi
+              next="$latest"
+              echo "resuming $next: its tag exists without a complete release"
+            fi
+          fi
+          previous=""
+          if [ -z "$next" ]; then
+            previous=$latest
+            IFS=. read -r major minor patch <<<"${latest:-v0.0.0}"
+            major=${major#v}
+            case "$BUMP" in
+              major) next="v$((major + 1)).0.0" ;;
+              minor) next="v${major}.$((minor + 1)).0" ;;
+              patch) next="v${major}.${minor}.$((patch + 1))" ;;
+            esac
+            # The first production release is v1.0.0 whatever the bump.
+            [ -z "$latest" ] && next="v1.0.0"
+            echo "cutting $next (previous: ${latest:-none}) from $GITHUB_SHA"
+            git tag "$next"
+            git push origin "$next"
+          else
+            previous=$(tail -n2 <<<"$tags" | head -n1 | grep -vx "$next" || true)
+          fi
+          echo "VERSION=$next" >>"$GITHUB_ENV"
+          echo "PREVIOUS=$previous" >>"$GITHUB_ENV"
+
+      - name: Build and push the versioned image
+        if: env.BUMP != 'dev'
+        run: |
+          # A resumed run reuses an image an earlier attempt already pushed,
+          # so a published :vX.Y.Z is never replaced.
+          if sudo skopeo inspect --raw "docker://$IMAGE:$VERSION" >/dev/null 2>&1; then
+            echo "$IMAGE:$VERSION already published; reusing it"
+            sudo podman pull "$IMAGE:$VERSION"
+          else
+            sudo podman build \
+              --build-arg VERSION="$VERSION" \
+              --build-arg REVISION="$GITHUB_SHA" \
+              --tag "$IMAGE:$VERSION" .
+            sudo podman push "$IMAGE:$VERSION"
+          fi
+
+      - name: Build the qcow2
+        if: env.BUMP != 'dev'
+        run: |
+          mkdir -p output
+          sudo podman run --rm --privileged \
+            --security-opt label=type:unconfined_t \
+            -v ./output:/output \
+            -v /var/lib/containers/storage:/var/lib/containers/storage \
+            "$IMAGE_BUILDER" build \
+            --output-dir /output \
+            --output-name "atelieros-$VERSION" \
+            --bootc-ref "$IMAGE:$VERSION" \
+            --bootc-default-fs xfs \
+            qcow2
+          sudo chown -R "$(id -u):$(id -g)" output
+          cd output
+          qcow2="atelieros-$VERSION.qcow2"
+          size=$(stat -c %s "$qcow2")
+          echo "$qcow2 is $size bytes"
+          echo "qcow2 size: $size bytes" >>"$GITHUB_STEP_SUMMARY"
+          if [ "$size" -ge "$MAX_ASSET_BYTES" ]; then
+            echo "::error::$qcow2 is $size bytes, over GitHub's 2 GiB release-asset limit; see the open question on ATE-1"
+            exit 1
+          fi
+          sha256sum "$qcow2" >"$qcow2.sha256"
+
+      - name: Move stable
+        if: env.BUMP != 'dev'
+        run: sudo skopeo copy --preserve-digests "docker://$IMAGE:$VERSION" "docker://$IMAGE:stable"
+
+      - name: Publish the GitHub Release
+        if: env.BUMP != 'dev'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          base=$(sed -n 's/^FROM //p' Containerfile | head -n1)
+          digest=$(sudo skopeo inspect --format '{{.Digest}}' "docker://$IMAGE:$VERSION")
+          changes="First release."
+          if [ -n "$PREVIOUS" ]; then
+            changes="Changes since $PREVIOUS: https://github.com/$GITHUB_REPOSITORY/compare/$PREVIOUS...$VERSION"
+          fi
+          # shellcheck disable=SC2016 # the notes quote literal backticks
+          printf -v notes '%s\n' \
+            "AtelierOS $VERSION, built from \`$base\`." \
+            '' \
+            "Image: \`$IMAGE:$VERSION\` (\`$digest\`)" \
+            '' \
+            'Machines tracking `:stable` download this release in the background. To apply it:' \
+            '' \
+            '```sh' \
+            'sudo bootc upgrade --from-downloaded --apply' \
+            '```' \
+            '' \
+            'The qcow2 is the disk image for new VMs. It has no user, SSH key or hostname; cloud-init provides them.' \
+            '' \
+            "$changes"
+          files=("output/atelieros-$VERSION.qcow2" "output/atelieros-$VERSION.qcow2.sha256")
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            gh release upload "$VERSION" "${files[@]}" --clobber
+          else
+            gh release create "$VERSION" "${files[@]}" --verify-tag \
+              --title "AtelierOS $VERSION" --notes "$notes"
+          fi

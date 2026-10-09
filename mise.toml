@@ -1,0 +1,19 @@
+[tasks.build]
+description = "Build the image locally as localhost/atelieros:local (runs bootc container lint)"
+run = "$(command -v podman || command -v docker) build --tag localhost/atelieros:local ."
+
+[tasks."release:patch"]
+description = "Dispatch the release workflow to cut a patch release"
+run = "gh workflow run release.yml -f bump=patch"
+
+[tasks."release:minor"]
+description = "Dispatch the release workflow to cut a minor release"
+run = "gh workflow run release.yml -f bump=minor"
+
+[tasks."release:major"]
+description = "Dispatch the release workflow to cut a major release"
+run = "gh workflow run release.yml -f bump=major"
+
+[tasks."release:dev"]
+description = "Rebuild :dev from main (pass --ref <branch> to build a pushed branch)"
+run = "gh workflow run release.yml -f bump=dev"
