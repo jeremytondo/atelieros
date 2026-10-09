@@ -142,6 +142,11 @@ jobs:
       - name: Build the qcow2
         if: env.BUMP != 'dev'
         run: |
+          # bootc follows the reference the disk was built from, so build it
+          # from a local :stable tag of this image. New machines then track
+          # :stable, not this version. The registry's :stable moves in the next
+          # step. Tagging here covers both a fresh build and a resumed run.
+          sudo podman tag "$IMAGE:$VERSION" "$IMAGE:stable"
           mkdir -p output
           sudo podman run --rm --privileged \
             --security-opt label=type:unconfined_t \
@@ -150,11 +155,21 @@ jobs:
             "$IMAGE_BUILDER" build \
             --output-dir /output \
             --output-name "atelieros-$VERSION" \
-            --bootc-ref "$IMAGE:$VERSION" \
+            --bootc-ref "$IMAGE:stable" \
             --bootc-default-fs xfs \
+            --with-manifest \
             qcow2
           sudo chown -R "$(id -u):$(id -g)" output
           cd output
+          # image-builder silently pulls a reference it can't find locally,
+          # which for :stable is the previous release. The osbuild manifest
+          # names the image that went into the disk.
+          want="sha256:$(sudo podman image inspect --format '{{.Id}}' "$IMAGE:$VERSION")"
+          got=$(jq -r '.sources."org.osbuild.containers-storage".items | keys | join(" ")' "atelieros-$VERSION.osbuild-manifest.json")
+          if [ "$got" != "$want" ]; then
+            echo "::error::the qcow2 was built from $got, not $IMAGE:$VERSION ($want)"
+            exit 1
+          fi
           qcow2="atelieros-$VERSION.qcow2"
           size=$(stat -c %s "$qcow2")
           echo "$qcow2 is $size bytes"

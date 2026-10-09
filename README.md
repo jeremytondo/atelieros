@@ -17,7 +17,7 @@ On top of `quay.io/fedora/fedora-bootc:44`, which already has openssh-server, po
 - **ptrace:** `kernel.yama.ptrace_scope = 1`.
 - **Firewall:** the default zone (`public`) accepts SSH only. The Tailscale interface is in the `trusted` zone. VMs opt out through cloud-init.
 - **Updates:** the bootc update timer downloads new versions but never applies them or reboots.
-- **Root filesystem:** XFS, for disk images and `bootc install`.
+- **Root filesystem:** XFS, for disk images and `bootc install`. In VMs, the base image's `bootc-generic-growpart.service` grows it to fill the disk at boot, so cloud-init's own resize modules are turned off.
 
 cloud-init and qemu-guest-agent stay inactive on bare metal. Tailscale runs but joins the tailnet only when someone enrolls the machine.
 
@@ -45,7 +45,7 @@ A production release does the following:
 
 1. It computes the next version from the repository's tags and tags the commit.
 2. It builds the image from that commit and pushes it as `:vX.Y.Z`.
-3. It builds a qcow2 disk image from it with [image-builder](https://github.com/osbuild/image-builder). The file isn't wrapped in `.xz` or similar, so Proxmox can import it directly. Like Fedora's cloud images, it's compressed inside the qcow2 format.
+3. It builds a qcow2 disk image from it with [image-builder](https://github.com/osbuild/image-builder). The disk is built from a local `:stable` tag of the image, because bootc follows the reference a disk was built from, so machines created from it track `:stable`. The release fails if the disk holds any other image. The file isn't wrapped in `.xz` or similar, so Proxmox can import it directly. Like Fedora's cloud images, it's compressed inside the qcow2 format.
 4. It moves `:stable` to the new image.
 5. It creates a GitHub Release with the qcow2 and its sha256 checksum.
 
@@ -58,6 +58,8 @@ Production tags, images and releases are never moved, edited or deleted. If a pr
 Every Monday the workflow cuts a patch release from `main`, so Fedora's updates reach `:stable` without anyone remembering. GitHub disables scheduled workflows after 60 days without repository activity. If the weekly releases stop, re-enable the workflow in the Actions tab.
 
 To check the image locally before releasing, run `mise run build`. It builds with podman or docker and runs `bootc container lint`.
+
+To check a qcow2, run `mise run smoke <qcow2>`. It boots a throwaway copy in qemu, the way Proxmox would: BIOS boot, a 20 GB disk and a NoCloud seed with a string `user:`. It then checks over SSH that the machine tracks `:stable` and runs the version in the file's name, that cloud-init reported nothing worse than `DEPRECATED`, that the root grew to fill the disk, and the image's SSH, SELinux, firewall and update settings. It needs qemu with KVM, xorriso and jq.
 
 ## Updating a machine
 
@@ -140,5 +142,6 @@ Machines receive it through the normal update path. If the new version misbehave
 | -- | -- |
 | `Containerfile` | The image: packages, configuration and the release marker |
 | `system_files/` | Files copied into the image's root |
-| `mise.toml` | The build and release tasks |
+| `mise.toml` | The build, smoke-boot and release tasks |
+| `scripts/smoke-boot` | The qemu smoke boot behind `mise run smoke` |
 | `.github/workflows/release.yml` | The release workflow and its weekly schedule |

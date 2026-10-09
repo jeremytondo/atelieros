@@ -1,6 +1,10 @@
 [tasks.build]
 description = "Build the image locally as localhost/atelieros:local (runs bootc container lint)"
-run = "$(command -v podman || command -v docker) build --tag localhost/atelieros:local ."
+run = "$(command -v podman || command -v docker) build --file Containerfile --tag localhost/atelieros:local ."
+
+[tasks.smoke]
+description = "Boot a qcow2 in qemu with a NoCloud seed and check it: mise run smoke <qcow2>"
+run = "scripts/smoke-boot"
 
 [tasks."release:patch"]
 description = "Dispatch the release workflow to cut a patch release"
