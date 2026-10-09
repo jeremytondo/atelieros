@@ -111,8 +111,9 @@ jobs:
               minor) next="v${major}.$((minor + 1)).0" ;;
               patch) next="v${major}.${minor}.$((patch + 1))" ;;
             esac
-            # The first production release is v1.0.0 whatever the bump.
-            [ -z "$latest" ] && next="v1.0.0"
+            # The first production release is v0.1.0 whatever the bump.
+            # v1.0.0 is cut deliberately, with release:major.
+            [ -z "$latest" ] && next="v0.1.0"
             echo "cutting $next (previous: ${latest:-none}) from $GITHUB_SHA"
             git tag "$next"
             git push origin "$next"
