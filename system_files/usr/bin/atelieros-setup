@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+# Sets up this machine for its user: mise, gh and a GitHub login, then the
+# owner's dotfiles, which bring the tools and everything else. The login hook
+# in /etc/profile.d starts it on each interactive login until it has finished.
+#
+# Usage:
+#   atelieros-setup                 log in to GitHub by scanning a QR code
+#   atelieros-setup --token-stdin   log in with a gh token read from standard
+#                                   input, with no prompts:
+#                                   gh auth token | ssh <host> atelieros-setup --token-stdin
+#
+# Each step is skipped when its result is already there, so a run that failed
+# or was interrupted can simply run again.
+set -uo pipefail
+
+dotfiles=jeremytondo/dotfiles
+state=$HOME/.local/state/atelieros
+marker=$state/setup-done
+mise=$HOME/.local/bin/mise
+zsh=/usr/bin/zsh
+user=$(id -un)
+
+# gh's own OAuth app, and the scopes `gh auth login` asks for.
+gh_client_id=178c6fc778ccc68e1d6a
+gh_scopes="repo read:org gist"
+
+token_stdin=0
+gh=""
+# Set by the login hook: this process replaced the login shell.
+login=0
+for arg; do
+    case $arg in
+        --token-stdin) token_stdin=1 ;;
+        --login) login=1 ;;
+        -h | --help)
+            sed -n '2,/^$/s/^# \{0,1\}//p' "$0"
+            exit 0
+            ;;
+        *)
+            echo "usage: atelieros-setup [--token-stdin]" >&2
+            exit 2
+            ;;
+    esac
+done
+
+# A run that hasn't finished. From the login hook, end in a plain login shell
+# rather than closing the session.
+give_up() {
+    if [ "$login" = 1 ]; then
+        echo "Setup starts again at your next login, or run atelieros-setup." >&2
+        exec 9>&-
+        export ATELIEROS_SETUP_SKIP=1
+        local shell
+        shell=$(getent passwd "$user" | cut -d: -f7)
+        exec "${shell:-/bin/bash}" -l
+    fi
+    exit "${1:-1}"
+}
+trap 'echo; echo "Setup interrupted." >&2; give_up 130' INT
+
+if [ "$(id -u)" = 0 ]; then
+    echo "Run atelieros-setup as your own user, not root." >&2
+    exit 1
+fi
+
+# Tokens come only from --token-stdin, never from the environment.
+unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
+export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"
+
+# Held until setup ends. Commands that might leave a process running close it,
+# so the lock doesn't outlive setup.
+mkdir -p "$state" || exit 1
+exec 9>"$state/setup.lock"
+if ! flock -n 9; then
+    echo "Setup is already in progress for $user." >&2
+    give_up
+fi
+
+token=""
+if [ "$token_stdin" = 1 ]; then
+    IFS= read -r token || true
+    token=${token//[[:space:]]/}
+    # Nothing later reads the token's pipe, or waits on it for input.
+    exec </dev/null
+fi
+
+as_root() {
+    if [ "$token_stdin" = 1 ]; then
+        sudo -n "$@"
+    else
+        sudo "$@"
+    fi
+}
+
+step() {
+    local name=$1
+    shift
+    echo "==> $name"
+    if ! "$@"; then
+        echo "atelieros-setup: failed: $name" >&2
+        give_up
+    fi
+}
+
+already() {
+    echo "    $*"
+}
+
+install_mise() {
+    if [ -x "$mise" ]; then
+        already "mise is installed"
+        return
+    fi
+    # Downloaded first, so a broken download never runs half a script. Quiet
+    # drops its advice to edit ~/.zshrc, which the dotfiles handle.
+    local installer status
+    installer=$(mktemp) || return
+    curl -fsSL https://mise.run -o "$installer" && MISE_QUIET=1 sh "$installer"
+    status=$?
+    rm -f "$installer"
+    return "$status"
+}
+
+# Installed without writing the global config, which the dotfiles bring. Their
+# `gh = "latest"` then finds this installation.
+install_gh() {
+    local version
+    if [ -z "$("$mise" ls --installed --json gh 2>/dev/null | jq -r '.[0].version // empty')" ]; then
+        "$mise" install gh@latest 9>&- || return
+    else
+        already "gh is installed"
+    fi
+    version=$("$mise" ls --installed --json gh | jq -r 'last.version') || return
+    gh=$("$mise" exec "gh@$version" -- sh -c 'command -v gh') && [ -x "$gh" ]
+}
+
+# Draws text in letters five rows high, for a code read off the screen.
+big() {
+    local -A font=(
+        [A]=".###.|#...#|#####|#...#|#...#" [B]="####.|#...#|####.|#...#|####."
+        [C]=".####|#....|#....|#....|.####" [D]="####.|#...#|#...#|#...#|####."
+        [E]="#####|#....|####.|#....|#####" [F]="#####|#....|####.|#....|#...."
+        [G]=".####|#....|#..##|#...#|.####" [H]="#...#|#...#|#####|#...#|#...#"
+        [I]="#####|..#..|..#..|..#..|#####" [J]="..###|...#.|...#.|#..#.|.##.."
+        [K]="#...#|#..#.|###..|#..#.|#...#" [L]="#....|#....|#....|#....|#####"
+        [M]="#...#|##.##|#.#.#|#...#|#...#" [N]="#...#|##..#|#.#.#|#..##|#...#"
+        [O]=".###.|#...#|#...#|#...#|.###." [P]="####.|#...#|####.|#....|#...."
+        [Q]=".###.|#...#|#.#.#|#..#.|.##.#" [R]="####.|#...#|####.|#..#.|#...#"
+        [S]=".####|#....|.###.|....#|####." [T]="#####|..#..|..#..|..#..|..#.."
+        [U]="#...#|#...#|#...#|#...#|.###." [V]="#...#|#...#|#...#|.#.#.|..#.."
+        [W]="#...#|#...#|#.#.#|##.##|#...#" [X]="#...#|.#.#.|..#..|.#.#.|#...#"
+        [Y]="#...#|.#.#.|..#..|..#..|..#.." [Z]="#####|...#.|..#..|.#...|#####"
+        [0]=".###.|#..##|#.#.#|##..#|.###." [1]="..#..|.##..|..#..|..#..|.###."
+        [2]=".###.|#...#|..##.|.#...|#####" [3]="####.|....#|.###.|....#|####."
+        [4]="#..#.|#..#.|#####|...#.|...#." [5]="#####|#....|####.|....#|####."
+        [6]=".###.|#....|####.|#...#|.###." [7]="#####|....#|...#.|..#..|..#.."
+        [8]=".###.|#...#|.###.|#...#|.###." [9]=".###.|#...#|.####|....#|.###."
+        [-]=".....|.....|.###.|.....|....."
+    )
+    local row i char line glyph rows
+    for row in 0 1 2 3 4; do
+        line="  "
+        for ((i = 0; i < ${#1}; i++)); do
+            char=${1:i:1}
+            glyph=${font[$char]:-".....|.....|.....|.....|....."}
+            IFS='|' read -r -a rows <<<"$glyph"
+            line+="${rows[row]} "
+        done
+        line=${line//./ }
+        echo "${line//#/█}"
+    done
+}
+
+# GitHub's device login, as `gh auth login --web` does it, with the address as
+# a QR code so a phone can approve it.
+device_login() {
+    local code device_code user_code uri expires interval deadline reply error
+    while :; do
+        code=$(curl -fsS -X POST https://github.com/login/device/code -H 'Accept: application/json' \
+            --data-urlencode "client_id=$gh_client_id" --data-urlencode "scope=$gh_scopes") || return
+        device_code=$(jq -r .device_code <<<"$code")
+        user_code=$(jq -r .user_code <<<"$code")
+        # GitHub sends no verification_uri_complete today; use it if it ever does.
+        uri=$(jq -r '.verification_uri_complete // .verification_uri' <<<"$code")
+        expires=$(jq -r .expires_in <<<"$code")
+        interval=$(jq -r .interval <<<"$code")
+
+        echo
+        echo "Log in to GitHub to finish setting up $HOSTNAME."
+        echo "Scan this code with your phone, or open $uri"
+        echo
+        qrencode -t ansiutf8 -m 2 "$uri"
+        echo
+        echo "Then enter this code:"
+        echo
+        big "$user_code"
+        echo
+        echo "  $user_code"
+        echo
+        echo "Waiting for approval. The code expires in $((expires / 60)) minutes."
+
+        deadline=$((SECONDS + expires))
+        while [ "$SECONDS" -lt "$deadline" ]; do
+            sleep "$interval"
+            # A dropped request is retried at the next poll.
+            reply=$(printf '%s' "$device_code" |
+                curl -fsS -X POST https://github.com/login/oauth/access_token -H 'Accept: application/json' \
+                    --data-urlencode "client_id=$gh_client_id" --data-urlencode "device_code@-" \
+                    --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:device_code") || continue
+            error=$(printf '%s' "$reply" | jq -r '.error // empty')
+            case $error in
+                "")
+                    printf '%s' "$reply" | jq -r .access_token |
+                        "$gh" auth login --hostname github.com --with-token
+                    return
+                    ;;
+                authorization_pending) ;;
+                slow_down) interval=$(printf '%s' "$reply" | jq -r --argjson i "$interval" '.interval // ($i + 5)') ;;
+                expired_token) break ;;
+                access_denied)
+                    echo "The login was cancelled on GitHub." >&2
+                    return 1
+                    ;;
+                *)
+                    echo "GitHub refused the login: $error" >&2
+                    return 1
+                    ;;
+            esac
+        done
+
+        echo "The code expired."
+        [ -t 0 ] || return 1
+        read -r -p "Press Enter for a new code, or Ctrl-C to stop. " || return 1
+    done
+}
+
+log_in() {
+    if "$gh" auth status --hostname github.com >/dev/null 2>&1; then
+        already "gh is logged in to github.com"
+        return
+    fi
+    if [ "$token_stdin" = 1 ]; then
+        if [ -z "$token" ]; then
+            echo "No token on standard input." >&2
+            return 1
+        fi
+        printf '%s\n' "$token" | "$gh" auth login --hostname github.com --with-token
+        return
+    fi
+    device_login
+}
+
+enable_linger() {
+    if [ -e "/var/lib/systemd/linger/$user" ]; then
+        already "linger is on"
+        return
+    fi
+    as_root loginctl enable-linger "$user"
+}
+
+set_shell() {
+    if [ "$(getent passwd "$user" | cut -d: -f7)" = "$zsh" ]; then
+        already "the login shell is zsh"
+        return
+    fi
+    as_root usermod --shell "$zsh" "$user"
+}
+
+# Adoption records the origin in the machine-local config, then restores the
+# files. An adoption that paused has the origin but no restored config, and
+# adopting again completes it.
+adopted() {
+    grep -qs '^\[history\.origin\]' "$HOME/.config/mise/config.local.toml" \
+        && [ -e "$HOME/.config/mise/config.toml" ]
+}
+
+# A fresh machine's starter files, such as ~/.zshrc and gh's config.yml, differ
+# from the dotfiles. --take-remote-all replaces them, saving each one first.
+# mise gives its own git commands a credential helper that reads gh's login
+# file, so the download and the watcher's pushes need nothing more.
+adopt_dotfiles() {
+    if adopted; then
+        already "the dotfiles are adopted; bootstrapping again"
+        "$mise" bootstrap --yes 9>&-
+    else
+        "$mise" bootstrap --adopt "$dotfiles" --take-remote-all --yes 9>&-
+    fi
+}
+
+step "Install mise" install_mise
+step "Install gh" install_gh
+step "Log in to GitHub" log_in
+unset token
+step "Turn on linger" enable_linger
+step "Set the login shell to zsh" set_shell
+step "Adopt the dotfiles" adopt_dotfiles
+step "Record that setup is done" touch "$marker"
+
+echo "Setup is done."
+if [ "$login" = 1 ] || { [ "$token_stdin" = 0 ] && [ -t 0 ] && [ -t 1 ]; }; then
+    exec 9>&-
+    exec "$zsh" -l
+fi

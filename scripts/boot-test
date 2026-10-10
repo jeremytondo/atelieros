@@ -50,10 +50,10 @@ qemu-system-x86_64 \
     -display none -serial file:"$work/console.log" \
     -daemonize -pidfile "$work/qemu.pid"
 
+ssh_opts=(-i "$work/key" -o BatchMode=yes -o ConnectTimeout=5
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
 vm() {
-    ssh -i "$work/key" -p "$port" -o BatchMode=yes -o ConnectTimeout=5 \
-        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
-        tester@127.0.0.1 "$@"
+    ssh "${ssh_opts[@]}" -p "$port" tester@127.0.0.1 "$@"
 }
 
 echo "Waiting for SSH on port $port"
@@ -110,6 +110,35 @@ check "ptrace_scope" "$(vm cat /proc/sys/kernel/yama/ptrace_scope)" 1
 check "public zone services" "$(vm sudo firewall-cmd --zone=public --list-services)" ssh
 check "update timer is download-only" \
     "$(vm systemctl show -P ExecStart bootc-fetch-apply-updates.service | grep -o -- '--download-only')" --download-only
+
+# First-login setup. Everything above ran over non-interactive SSH, which must
+# never start it.
+check "qrencode" "$(vm command -v qrencode)" /usr/bin/qrencode
+check "atelieros-setup" "$(vm command -v atelieros-setup)" /usr/bin/atelieros-setup
+echo scp-ok >"$work/scp-test"
+scp -q "${ssh_opts[@]}" -P "$port" "$work/scp-test" tester@127.0.0.1:
+check "scp is unaffected" "$(vm cat scp-test)" scp-ok
+check "commands don't start setup (no setup state or mise)" \
+    "$(vm 'ls -d ~/.local/state/atelieros ~/.local/bin/mise 2>/dev/null')" ""
+
+# The interactive trigger, with a sentinel in place of setup. The overlay keeps
+# /usr writable until the VM stops, so this comes last.
+vm sudo bootc usr-overlay >/dev/null
+vm sudo tee /usr/bin/atelieros-setup >/dev/null <<'EOF'
+#!/bin/sh
+echo "sentinel: atelieros-setup $*"
+EOF
+# A session with a terminal. It types exit, in case setup doesn't start.
+tty_session() {
+    printf 'exit\n' | timeout 60 ssh "${ssh_opts[@]}" -p "$port" -tt tester@127.0.0.1 "$@" 2>/dev/null |
+        tr -d '\r' | grep -o 'sentinel: .*' || true
+}
+check "a login starts setup" "$(tty_session)" "sentinel: atelieros-setup --login"
+check "a bash login starts setup" "$(tty_session bash -l)" "sentinel: atelieros-setup --login"
+check "a zsh login starts setup" "$(tty_session zsh -l)" "sentinel: atelieros-setup --login"
+check "a command with a terminal doesn't start setup" "$(tty_session echo hi)" ""
+vm 'mkdir -p ~/.local/state/atelieros && touch ~/.local/state/atelieros/setup-done'
+check "a login after setup doesn't start it" "$(tty_session)" ""
 
 if [ "$failed" -ne 0 ]; then
     echo "Boot test failed"

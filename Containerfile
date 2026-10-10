@@ -17,6 +17,7 @@ RUN dnf -y install \
         libatomic \
         ncurses-term \
         qemu-guest-agent \
+        qrencode \
         tailscale \
         zsh \
     && dnf clean all \
