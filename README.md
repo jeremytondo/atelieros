@@ -10,8 +10,9 @@ The image is public at `ghcr.io/jeremytondo/atelieros`. It must never contain se
 
 On top of `quay.io/fedora/fedora-bootc:44`, which already has openssh-server, podman, toolbox, sudo and NetworkManager:
 
-- **Packages:** git, zsh, libatomic, `xterm-ghostty` terminfo, Tailscale, cloud-init, qemu-guest-agent, distrobox, Chromium and firewalld.
+- **Packages:** git, zsh, libatomic, `xterm-ghostty` terminfo, Tailscale, cloud-init, qemu-guest-agent, distrobox, Chromium, firewalld and qrencode.
 - **Shell:** zsh is the default login shell for new users.
+- **First-login setup:** `atelieros-setup`, and a login hook that starts it. See [Setting up a new machine](#setting-up-a-new-machine).
 - **SSH:** key authentication only. Password authentication and root login are rejected.
 - **SELinux:** enforcing, with `virt_qemu_ga_read_nonsecurity_files` on.
 - **ptrace:** `kernel.yama.ptrace_scope = 1`.
@@ -59,7 +60,47 @@ Every Monday the workflow cuts a patch release from `main`, so Fedora's updates 
 
 To check the image locally before releasing, run `mise run build`. It builds with podman or docker and runs `bootc container lint`.
 
-To check a qcow2, run `mise run boot-test <qcow2>`. It boots a throwaway copy in qemu the way Proxmox would, then checks over SSH that it tracks `:stable`, that cloud-init finished cleanly, that the root grew to fill the disk, and the image's settings. It needs qemu with KVM, xorriso and jq.
+To check a qcow2, run `mise run boot-test <qcow2>`. It boots a throwaway copy in qemu the way Proxmox would, then checks over SSH that it tracks `:stable`, that cloud-init finished cleanly, that the root grew to fill the disk, and the image's settings. It also checks that SSH commands and scp never start first-login setup, while a login with a terminal does. It needs qemu with KVM, xorriso and jq.
+
+## Setting up a new machine
+
+A new machine sets itself up the first time its user logs in interactively, over SSH or at the console. `atelieros-setup` gets one thing from the owner, a GitHub login. The owner's dotfiles (`jeremytondo/dotfiles`) do everything else. Setup runs these steps:
+
+1. It installs mise in the home directory with mise's official installer, so `mise self-update` works.
+2. It installs gh through mise. The dotfiles' `gh = "latest"` then uses this same installation.
+3. It logs gh in to GitHub.
+4. It turns on linger, so the dotfile history watcher runs without a login session.
+5. It sets the login shell to zsh.
+6. It adopts the dotfiles with `mise bootstrap --adopt jeremytondo/dotfiles --take-remote-all`, which also installs the tools they list. Where a starter file differs, such as Fedora's `~/.zshrc` or gh's `config.yml`, the dotfiles' version replaces it. On a machine that already adopted them, setup runs `mise bootstrap` instead.
+7. It records that setup is done, in `~/.local/state/atelieros/setup-done`, and starts a zsh login shell.
+
+On bare metal, setup shows a QR code for GitHub's device login, and a one-time code. Scan the QR code with your phone, enter the code and approve. Setup then continues on its own. If the code expires first, setup offers a new one.
+
+A VM can be set up with no prompts by handing it the workstation's gh login:
+
+```sh
+gh auth token | ssh <vm> atelieros-setup --token-stdin
+```
+
+Setup never accepts a token as an argument or an environment variable, and never prints one. The token is stored only in gh's login file, `~/.config/gh/hosts.yml`.
+
+If setup fails or is interrupted, it names the step that failed and leaves you in a plain shell. It starts again at the next interactive login, and skips the steps that already finished. You can also run `atelieros-setup` by hand at any time. SSH commands, scp, sftp and remote editors never start it.
+
+### Revoking GitHub access
+
+Setup uses gh's own login, which covers all repositories and doesn't expire. VMs set up with `--token-stdin` share the workstation's token, so revoking it logs all of them out. A machine can get its own token with `gh auth login`.
+
+- `gh auth logout` only removes the token from that machine. GitHub still accepts it.
+- To revoke one token, run this on a machine that has it:
+
+  ```sh
+  gh auth token | jq -Rc '{credentials: [.]}' |
+      curl -fsS -X POST https://api.github.com/credentials/revoke \
+          -H 'Accept: application/vnd.github+json' --data @-
+  ```
+
+  GitHub's [credential-revocation endpoint](https://docs.github.com/en/rest/credentials/revoke) takes the token itself and no other authentication.
+- To revoke every machine at once, revoke **GitHub CLI** in GitHub's settings, under **Applications** > **Authorized OAuth Apps**.
 
 ## Updating a machine
 
@@ -141,7 +182,7 @@ Machines receive it through the normal update path. If the new version misbehave
 | Path | Purpose |
 | -- | -- |
 | `Containerfile` | The image: packages, configuration and the release marker |
-| `system_files/` | Files copied into the image's root |
+| `system_files/` | Files copied into the image's root, including `atelieros-setup` and its login hook |
 | `mise.toml` | The build, boot-test and release tasks |
 | `scripts/boot-test` | The qemu boot test behind `mise run boot-test` |
 | `.github/workflows/release.yml` | The release workflow and its weekly schedule |
